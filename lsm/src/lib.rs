@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self},
@@ -26,27 +27,34 @@ pub struct Db {
 impl Db {
     pub fn create(log_path: impl AsRef<Path>) -> Result<Self, DbError> {
         let mut wal = Wal::create(log_path)?;
-        let mut content = String::new();
-        wal.file.read_to_string(&mut content)?;
+        let mut btree: BTreeMap<Bytes, Bytes> = BTreeMap::new();
 
-        let mut btree = BTreeMap::new();
-        content.split('\n').for_each(|line| {
-            if let Some((key, value)) = line.split_once(',') {
-                btree.insert(
-                    Bytes::copy_from_slice(key.as_bytes()),
-                    Bytes::copy_from_slice(value.as_bytes()),
-                );
+        let mut buf = String::new();
+        let _ = wal.file.read_to_string(&mut buf)?;
+        for line in buf.lines() {
+            if line.trim().is_empty() {
+                continue;
             }
-        });
+            let wal_entry = serde_json::from_str(line)?;
+            match wal_entry {
+                WalEntry::Put { key, value } => {
+                    btree.insert(Bytes::from(key), Bytes::from(value));
+                }
+                WalEntry::Delete { key } => {
+                    btree.insert(key.into(), Bytes::new());
+                }
+            }
+        }
+
         let map = Arc::new(RwLock::new(btree));
 
-        Ok(Self {
-            map,
-            wal,
-        })
+        Ok(Self { map, wal })
     }
     pub fn put(&mut self, key: &str, value: &str) -> Result<(), DbError> {
-        self.wal.write(key, value)?;
+        self.wal.append(&WalEntry::Put {
+            key: key.into(),
+            value: value.into(),
+        })?;
         self.map.write().map_err(|_| DbError::LockPoisoned)?.insert(
             Bytes::copy_from_slice(key.as_bytes()),
             Bytes::copy_from_slice(value.as_bytes()),
@@ -63,10 +71,22 @@ impl Db {
     }
 
     pub fn delete(&mut self, key: &str) -> Result<(), DbError> {
-        self.put(key, "")
+        self.wal.append(&WalEntry::Delete { key: key.into() })?;
+        self.map.write().map_err(|_| DbError::LockPoisoned)?.insert(
+            Bytes::copy_from_slice(key.as_bytes()),
+            Bytes::copy_from_slice(&Bytes::new()),
+        );
+        Ok(())
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+enum WalEntry {
+    Put { key: String, value: String },
+    Delete { key: String },
+}
+
+// we use json for this wal bc i wanna read the contents
 pub struct Wal {
     file: fs::File,
 }
@@ -80,8 +100,10 @@ impl Wal {
             .open(path)?;
         Ok(Self { file })
     }
-    pub fn write(&mut self, key: &str, value: &str) -> Result<(), DbError> {
-        writeln!(self.file, "{key},{value}")?;
+    fn append(&mut self, entry: &WalEntry) -> Result<(), DbError> {
+        let entry = serde_json::to_string(entry)?;
+        let _ = self.file.write(entry.as_bytes())?;
+        self.file.write_all(b"\n")?;
         Ok(())
     }
 }
@@ -92,7 +114,8 @@ mod tests {
 
     #[test]
     fn put_then_get_returns_value() -> Result<(), DbError> {
-        let path = std::env::temp_dir().join("lsm-test-wal.log");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wal.log");
         let mut db = Db::create(&path)?;
 
         db.put("20", "hi")?;
@@ -104,7 +127,8 @@ mod tests {
 
     #[test]
     fn put_then_delete_then_get_returns_nothing() -> Result<(), DbError> {
-        let path = std::env::temp_dir().join("lsm-test-wal.log");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wal.log");
         let mut db = Db::create(&path)?;
 
         db.put("20", "hi")?;
@@ -116,7 +140,8 @@ mod tests {
     }
     #[test]
     fn delete_does_note_crash() -> Result<(), DbError> {
-        let path = std::env::temp_dir().join("lsm-test-wal.log");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wal.log");
         let mut db = Db::create(&path)?;
 
         db.delete("20")?;
@@ -124,7 +149,8 @@ mod tests {
     }
     #[test]
     fn get_not_found() -> Result<(), DbError> {
-        let path = std::env::temp_dir().join("lsm-test-wal.log");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wal.log");
         let db = Db::create(&path)?;
 
         assert_eq!(db.get("20")?, None);
@@ -132,7 +158,8 @@ mod tests {
     }
     #[test]
     fn update_value() -> Result<(), DbError> {
-        let path = std::env::temp_dir().join("lsm-test-wal.log");
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wal.log");
         let mut db = Db::create(&path)?;
 
         db.put("20", "hi")?;
