@@ -5,7 +5,7 @@ use std::{
     fs::{self},
     io::{self, Read, Write},
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicUsize},
 };
 use thiserror::Error;
 
@@ -20,17 +20,28 @@ pub enum DbError {
 }
 
 pub struct Db {
-    map: Arc<RwLock<BTreeMap<Bytes, Bytes>>>,
+    memtable: RwLock<Memtable>,
+    locked_tables: Vec<Memtable>,
     wal: Wal,
+}
+
+static MAX_MEMTABLE_SIZE: u32 = 100;
+
+pub struct Memtable {
+    tree: Arc<RwLock<BTreeMap<Bytes, Bytes>>>,
+    size: AtomicUsize,
 }
 
 impl Db {
     pub fn create(log_path: impl AsRef<Path>) -> Result<Self, DbError> {
-        let mut wal = Wal::create(log_path)?;
+        let wal = Wal::create(log_path)?;
         let mut btree: BTreeMap<Bytes, Bytes> = BTreeMap::new();
 
         let mut buf = String::new();
-        let _ = wal.file.read_to_string(&mut buf)?;
+        {
+            let mut file = wal.file.lock().map_err(|_| DbError::LockPoisoned)?;
+            file.read_to_string(&mut buf)?;
+        }
         for line in buf.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -46,36 +57,75 @@ impl Db {
             }
         }
 
-        let map = Arc::new(RwLock::new(btree));
+        let tree = Arc::new(RwLock::new(btree));
 
-        Ok(Self { map, wal })
+        Ok(Self {
+            wal,
+            memtable: RwLock::new(Memtable {
+                tree,
+                size: AtomicUsize::new(0),
+            }),
+            locked_tables: Vec::new(),
+        })
     }
-    pub fn put(&mut self, key: &str, value: &str) -> Result<(), DbError> {
+    pub fn put(&self, key: &str, value: &str) -> Result<(), DbError> {
         self.wal.append(&WalEntry::Put {
             key: key.into(),
             value: value.into(),
         })?;
-        self.map.write().map_err(|_| DbError::LockPoisoned)?.insert(
-            Bytes::copy_from_slice(key.as_bytes()),
-            Bytes::copy_from_slice(value.as_bytes()),
-        );
+        let payload_size = key.len() + value.len();
+        let old_size = self
+            .memtable
+            .size
+            .fetch_add(payload_size, std::sync::atomic::Ordering::Relaxed);
+        self.memtable
+            .tree
+            .write()
+            .map_err(|_| DbError::LockPoisoned)?
+            .insert(
+                Bytes::copy_from_slice(key.as_bytes()),
+                Bytes::copy_from_slice(value.as_bytes()),
+            );
+        if old_size + payload_size >= MAX_MEMTABLE_SIZE as usize {
+            self.lock();
+        }
+
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Bytes>, DbError> {
-        let map = self.map.read().map_err(|_| DbError::LockPoisoned)?;
+        let map = self
+            .memtable
+            .tree
+            .read()
+            .map_err(|_| DbError::LockPoisoned)?;
         Ok(map
             .get(key.as_bytes())
             .cloned()
             .filter(|value| !value.is_empty()))
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<(), DbError> {
+    pub fn delete(&self, key: &str) -> Result<(), DbError> {
         self.wal.append(&WalEntry::Delete { key: key.into() })?;
-        self.map.write().map_err(|_| DbError::LockPoisoned)?.insert(
-            Bytes::copy_from_slice(key.as_bytes()),
-            Bytes::copy_from_slice(&Bytes::new()),
-        );
+        self.memtable
+            .tree
+            .write()
+            .map_err(|_| DbError::LockPoisoned)?
+            .insert(
+                Bytes::copy_from_slice(key.as_bytes()),
+                Bytes::copy_from_slice(&Bytes::new()),
+            );
+        Ok(())
+    }
+
+    pub fn lock(&self) -> Result<(), DbError> {
+        let fresh = Memtable {
+            tree: Arc::new(RwLock::new(BTreeMap::new())),
+            size: 0.into(),
+        };
+        let memtable = self.memtable.write().map_err(|_| DbError::LockPoisoned)?;
+        let old = std::mem::replace(&mut memtable, fresh);
+        self.locked_tables.push(old);
         Ok(())
     }
 }
@@ -88,7 +138,7 @@ enum WalEntry {
 
 // we use json for this wal bc i wanna read the contents
 pub struct Wal {
-    file: fs::File,
+    file: Mutex<fs::File>,
 }
 
 impl Wal {
@@ -98,12 +148,16 @@ impl Wal {
             .read(true)
             .append(true)
             .open(path)?;
-        Ok(Self { file })
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
-    fn append(&mut self, entry: &WalEntry) -> Result<(), DbError> {
+    fn append(&self, entry: &WalEntry) -> Result<(), DbError> {
         let entry = serde_json::to_string(entry)?;
-        let _ = self.file.write(entry.as_bytes())?;
-        self.file.write_all(b"\n")?;
+        let mut file = self.file.lock().map_err(|_| DbError::LockPoisoned)?;
+
+        file.write(entry.as_bytes())?;
+        file.write_all(b"\n")?;
         Ok(())
     }
 }
@@ -116,7 +170,7 @@ mod tests {
     fn put_then_get_returns_value() -> Result<(), DbError> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("wal.log");
-        let mut db = Db::create(&path)?;
+        let db = Db::create(&path)?;
 
         db.put("20", "hi")?;
 
@@ -129,7 +183,7 @@ mod tests {
     fn put_then_delete_then_get_returns_nothing() -> Result<(), DbError> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("wal.log");
-        let mut db = Db::create(&path)?;
+        let db = Db::create(&path)?;
 
         db.put("20", "hi")?;
         db.delete("20")?;
@@ -142,7 +196,7 @@ mod tests {
     fn delete_does_note_crash() -> Result<(), DbError> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("wal.log");
-        let mut db = Db::create(&path)?;
+        let db = Db::create(&path)?;
 
         db.delete("20")?;
         Ok(())
@@ -160,7 +214,7 @@ mod tests {
     fn update_value() -> Result<(), DbError> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("wal.log");
-        let mut db = Db::create(&path)?;
+        let db = Db::create(&path)?;
 
         db.put("20", "hi")?;
         assert_eq!(db.get("20")?, Some(Bytes::from("hi")));
